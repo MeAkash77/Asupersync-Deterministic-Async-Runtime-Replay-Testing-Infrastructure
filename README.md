@@ -15,7 +15,7 @@
 
 **Spec-first, cancel-correct, capability-secure async for Rust**
 
-<h3><a href="https://dicklesworthstone.github.io/asupersync/asupersync_web_demo.html">Try the Live Interactive WASM Demo</a></h3>
+<h3><a href="https://asupersync-deterministic-async.netlify.app/">Try the Live Interactive WASM Demo</a></h3>
 
 <h3>Quick Install</h3>
 
