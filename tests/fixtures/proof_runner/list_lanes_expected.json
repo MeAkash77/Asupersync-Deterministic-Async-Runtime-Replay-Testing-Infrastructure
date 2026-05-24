@@ -1,0 +1,18 @@
+{
+  "available_lanes": [
+    "default-production-tokio-tree",
+    "metrics-production-tokio-tree",
+    "fuzz-tokio-quarantine-tree",
+    "workspace-normal-tokio-audit",
+    "native-feature-smoke",
+    "fuzz-manifest-smoke",
+    "lib-tests",
+    "all-targets-check",
+    "clippy-all-targets",
+    "rustfmt-check",
+    "rustdoc-api",
+    "formal-lean-build",
+    "proof-lane-manifest-contract",
+    "atp-native-quic-dependency-audit"
+  ]
+}

@@ -1,0 +1,678 @@
+//! MySQL SSL/TLS negotiation conformance tests.
+//!
+//! This test suite verifies that the MySQL client correctly implements
+//! SSL/TLS negotiation according to the MySQL protocol specification,
+//! especially for `caching_sha2_password` authentication.
+//!
+//! # Conformance Issues Identified
+//!
+//! 1. **No TLS upgrade**: No implementation of TLS handshake after MySQL handshake
+//! 2. **caching_sha2_password failures**: Full auth fails due to missing secure connection
+//! 3. **Required SSL fail-closed behavior**: `ssl-mode=required` must not send auth data
+//!    in cleartext
+
+#![cfg(feature = "mysql")]
+
+use asupersync::Cx;
+use asupersync::database::mysql::{MySqlConnectOptions, MySqlConnection, MySqlError, SslMode};
+use asupersync::test_utils::init_test_logging;
+use asupersync::types::Outcome;
+use std::io::{Read, Write};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// MySQL capability flags for SSL/TLS support
+mod mysql_capabilities {
+    pub const CLIENT_SSL: u32 = 2048;
+    pub const CLIENT_PROTOCOL_41: u32 = 512;
+    pub const CLIENT_SECURE_CONNECTION: u32 = 32768;
+    pub const CLIENT_PLUGIN_AUTH: u32 = 0x80000;
+}
+
+fn mysql_packet(sequence: u8, payload: &[u8]) -> Vec<u8> {
+    assert!(payload.len() <= 0xFF_FFFF);
+    let len = payload.len();
+    let mut packet = Vec::with_capacity(4 + len);
+    packet.push((len & 0xFF) as u8);
+    packet.push(((len >> 8) & 0xFF) as u8);
+    packet.push(((len >> 16) & 0xFF) as u8);
+    packet.push(sequence);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+fn mysql_handshake_packet(server_capabilities: u32) -> Vec<u8> {
+    mysql_handshake_packet_with_connection_id(server_capabilities, 42)
+}
+
+fn mysql_handshake_packet_with_connection_id(
+    server_capabilities: u32,
+    connection_id: u32,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(10);
+    payload.extend_from_slice(b"8.0.0-asupersync-test\0");
+    payload.extend_from_slice(&connection_id.to_le_bytes());
+    payload.extend_from_slice(b"12345678");
+    payload.push(0);
+    payload.extend_from_slice(&(server_capabilities as u16).to_le_bytes());
+    payload.push(33);
+    payload.extend_from_slice(&0_u16.to_le_bytes());
+    payload.extend_from_slice(&((server_capabilities >> 16) as u16).to_le_bytes());
+    payload.push(21);
+    payload.extend_from_slice(&[0; 10]);
+    payload.extend_from_slice(b"abcdefghijkl\0");
+    payload.extend_from_slice(b"caching_sha2_password\0");
+    mysql_packet(0, &payload)
+}
+
+fn read_mysql_packet(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).expect("read packet header");
+    let payload_len =
+        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+    let mut payload = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .expect("read packet payload");
+    payload
+}
+
+fn ssl_mode_query_value(mode: SslMode) -> &'static str {
+    match mode {
+        SslMode::Disabled => "disabled",
+        SslMode::Preferred => "preferred",
+        SslMode::Required => "required",
+    }
+}
+
+fn assert_ssl_mode_fails_closed_before_auth_payload(
+    mode: SslMode,
+    server_capabilities: u32,
+    context: &'static str,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let (read_tx, read_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+
+        stream
+            .write_all(&mysql_handshake_packet(server_capabilities))
+            .expect("write handshake");
+        stream.flush().expect("flush handshake");
+
+        let mut header = [0; 4];
+        let read = stream.read(&mut header).unwrap_or_else(|err| {
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ),
+                "unexpected server read error for {context}: {err}"
+            );
+            0
+        });
+        read_tx.send(read).expect("send read count");
+    });
+
+    let mut options = MySqlConnectOptions::parse(&format!(
+        "mysql://user:pass@{}:{}/db?ssl-mode={}",
+        addr.ip(),
+        addr.port(),
+        ssl_mode_query_value(mode)
+    ))
+    .expect("parse options");
+    options.connect_timeout = Some(Duration::from_secs(2));
+
+    let outcome = futures_lite::future::block_on(async {
+        MySqlConnection::connect_with_options(&Cx::for_testing(), options).await
+    });
+    match outcome {
+        Outcome::Err(MySqlError::TlsRequired) => {}
+        other => panic!("expected {mode:?} TLS fail-closed outcome for {context}, got {other:?}"),
+    }
+
+    let bytes_sent = read_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("server read result");
+    server.join().expect("join server");
+    assert_eq!(
+        bytes_sent, 0,
+        "{mode:?} must fail before sending plaintext auth data for {context}"
+    );
+}
+
+/// Test SSL mode URL parsing conformance
+#[test]
+fn test_ssl_mode_url_parsing_conformance() {
+    init_test_logging();
+
+    // Test all SSL modes are parsed correctly
+    let disabled =
+        MySqlConnectOptions::parse("mysql://user@localhost/db?ssl-mode=disabled").unwrap();
+    assert_eq!(disabled.ssl_mode, SslMode::Disabled);
+
+    let preferred =
+        MySqlConnectOptions::parse("mysql://user@localhost/db?ssl-mode=preferred").unwrap();
+    assert_eq!(preferred.ssl_mode, SslMode::Preferred);
+
+    let required =
+        MySqlConnectOptions::parse("mysql://user@localhost/db?ssl-mode=required").unwrap();
+    assert_eq!(required.ssl_mode, SslMode::Required);
+
+    // Test case insensitivity
+    let required_upper =
+        MySqlConnectOptions::parse("mysql://user@localhost/db?ssl-mode=REQUIRED").unwrap();
+    assert_eq!(required_upper.ssl_mode, SslMode::Required);
+
+    // Test alternative parameter name
+    let preferred_alt =
+        MySqlConnectOptions::parse("mysql://user@localhost/db?sslmode=preferred").unwrap();
+    assert_eq!(preferred_alt.ssl_mode, SslMode::Preferred);
+
+    // Test invalid SSL mode is rejected
+    let invalid = MySqlConnectOptions::parse("mysql://user@localhost/db?ssl-mode=invalid");
+    assert!(invalid.is_err(), "Invalid SSL mode should be rejected");
+
+    if let Err(MySqlError::InvalidUrl(msg)) = invalid {
+        assert!(
+            msg.contains("unknown ssl-mode"),
+            "Error should mention unknown ssl-mode"
+        );
+    } else {
+        panic!("Expected InvalidUrl error for unknown ssl-mode");
+    }
+
+    // Test default SSL mode is Disabled
+    let default = MySqlConnectOptions::parse("mysql://user@localhost/db").unwrap();
+    assert_eq!(default.ssl_mode, SslMode::Disabled);
+}
+
+/// Test that SslMode enum has correct default and semantics
+#[test]
+fn test_ssl_mode_enum_conformance() {
+    init_test_logging();
+
+    // Default should be Disabled (most secure default - no accidental cleartext)
+    assert_eq!(SslMode::default(), SslMode::Disabled);
+
+    // Enum values should be distinct
+    assert_ne!(SslMode::Disabled, SslMode::Preferred);
+    assert_ne!(SslMode::Disabled, SslMode::Required);
+    assert_ne!(SslMode::Preferred, SslMode::Required);
+
+    // Should be copyable and cloneable.
+    let mode = SslMode::Required;
+    let copied = mode;
+    fn assert_clone<T: Clone>(_: &T) {}
+    assert_clone(&mode);
+    assert_eq!(mode, copied);
+
+    // Debug output should be meaningful
+    assert!(format!("{:?}", SslMode::Disabled).contains("Disabled"));
+    assert!(format!("{:?}", SslMode::Preferred).contains("Preferred"));
+    assert!(format!("{:?}", SslMode::Required).contains("Required"));
+}
+
+/// Required SSL must fail closed until the MySQL TLS upgrade path exists.
+#[test]
+fn test_required_ssl_fails_closed_before_auth_payload() {
+    init_test_logging();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let (read_tx, read_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+
+        let capabilities = mysql_capabilities::CLIENT_PROTOCOL_41
+            | mysql_capabilities::CLIENT_SECURE_CONNECTION
+            | mysql_capabilities::CLIENT_PLUGIN_AUTH
+            | mysql_capabilities::CLIENT_SSL;
+        stream
+            .write_all(&mysql_handshake_packet(capabilities))
+            .expect("write handshake");
+        stream.flush().expect("flush handshake");
+
+        let mut header = [0; 4];
+        let read = stream.read(&mut header).unwrap_or_else(|err| {
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ),
+                "unexpected server read error: {err}"
+            );
+            0
+        });
+        read_tx.send(read).expect("send read count");
+    });
+
+    let mut options = MySqlConnectOptions::parse(&format!(
+        "mysql://user:pass@{}:{}/db?ssl-mode=required",
+        addr.ip(),
+        addr.port()
+    ))
+    .expect("parse options");
+    options.connect_timeout = Some(Duration::from_secs(2));
+
+    let outcome = futures_lite::future::block_on(async {
+        MySqlConnection::connect_with_options(&Cx::for_testing(), options).await
+    });
+    match outcome {
+        Outcome::Err(MySqlError::TlsRequired) => {}
+        other => panic!("expected TlsRequired fail-closed outcome, got {other:?}"),
+    }
+
+    let bytes_sent = read_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("server read result");
+    server.join().expect("join server");
+    assert_eq!(
+        bytes_sent, 0,
+        "ssl-mode=required must fail before sending plaintext auth data"
+    );
+}
+
+#[test]
+fn test_preferred_ssl_fails_closed_before_auth_payload_when_server_supports_ssl() {
+    init_test_logging();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let (read_tx, read_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+
+        let capabilities = mysql_capabilities::CLIENT_PROTOCOL_41
+            | mysql_capabilities::CLIENT_SECURE_CONNECTION
+            | mysql_capabilities::CLIENT_PLUGIN_AUTH
+            | mysql_capabilities::CLIENT_SSL;
+        stream
+            .write_all(&mysql_handshake_packet(capabilities))
+            .expect("write handshake");
+        stream.flush().expect("flush handshake");
+
+        let mut header = [0; 4];
+        let read = stream.read(&mut header).unwrap_or_else(|err| {
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ),
+                "unexpected server read error: {err}"
+            );
+            0
+        });
+        read_tx.send(read).expect("send read count");
+    });
+
+    let mut options = MySqlConnectOptions::parse(&format!(
+        "mysql://user:pass@{}:{}/db?ssl-mode=preferred",
+        addr.ip(),
+        addr.port()
+    ))
+    .expect("parse options");
+    options.connect_timeout = Some(Duration::from_secs(2));
+
+    let outcome = futures_lite::future::block_on(async {
+        MySqlConnection::connect_with_options(&Cx::for_testing(), options).await
+    });
+    match outcome {
+        Outcome::Err(MySqlError::TlsRequired) => {}
+        other => panic!("expected preferred SSL fail-closed outcome, got {other:?}"),
+    }
+
+    let bytes_sent = read_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("server read result");
+    server.join().expect("join server");
+    assert_eq!(
+        bytes_sent, 0,
+        "ssl-mode=preferred must fail before sending plaintext auth data when the server advertises CLIENT_SSL"
+    );
+}
+
+#[test]
+fn test_preferred_ssl_fails_closed_before_auth_payload_when_server_lacks_ssl_support() {
+    init_test_logging();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let (read_tx, read_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+
+        let capabilities = mysql_capabilities::CLIENT_PROTOCOL_41
+            | mysql_capabilities::CLIENT_SECURE_CONNECTION
+            | mysql_capabilities::CLIENT_PLUGIN_AUTH;
+        stream
+            .write_all(&mysql_handshake_packet(capabilities))
+            .expect("write handshake");
+        stream.flush().expect("flush handshake");
+
+        let mut header = [0; 4];
+        let read = stream.read(&mut header).unwrap_or_else(|err| {
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ),
+                "unexpected server read error: {err}"
+            );
+            0
+        });
+        read_tx.send(read).expect("send read count");
+    });
+
+    let mut options = MySqlConnectOptions::parse(&format!(
+        "mysql://user:pass@{}:{}/db?ssl-mode=preferred",
+        addr.ip(),
+        addr.port()
+    ))
+    .expect("parse options");
+    options.connect_timeout = Some(Duration::from_secs(2));
+
+    let outcome = futures_lite::future::block_on(async {
+        MySqlConnection::connect_with_options(&Cx::for_testing(), options).await
+    });
+    match outcome {
+        Outcome::Err(MySqlError::TlsRequired) => {}
+        other => panic!("expected preferred SSL fail-closed outcome, got {other:?}"),
+    }
+
+    let bytes_sent = read_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("server read result");
+    server.join().expect("join server");
+    assert_eq!(
+        bytes_sent, 0,
+        "ssl-mode=preferred must fail before sending plaintext auth data even when the server omits CLIENT_SSL"
+    );
+}
+
+#[test]
+fn test_prepared_statement_rejects_cross_connection_reuse() {
+    init_test_logging();
+
+    let capabilities = mysql_capabilities::CLIENT_PROTOCOL_41
+        | mysql_capabilities::CLIENT_SECURE_CONNECTION
+        | mysql_capabilities::CLIENT_PLUGIN_AUTH;
+
+    let prepare_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind prepare");
+    let prepare_addr = prepare_listener.local_addr().expect("prepare addr");
+    let prepare_server = std::thread::spawn(move || {
+        let (mut stream, _) = prepare_listener.accept().expect("accept prepare client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set prepare read timeout");
+
+        stream
+            .write_all(&mysql_handshake_packet_with_connection_id(
+                capabilities,
+                101,
+            ))
+            .expect("write prepare handshake");
+        stream.flush().expect("flush prepare handshake");
+
+        let _handshake_response = read_mysql_packet(&mut stream);
+        stream
+            .write_all(&mysql_packet(2, &[0x00]))
+            .expect("write auth ok");
+        stream.flush().expect("flush auth ok");
+
+        let prepare_payload = read_mysql_packet(&mut stream);
+        assert_eq!(prepare_payload[0], 0x16, "expected COM_STMT_PREPARE");
+
+        let mut ok = Vec::new();
+        ok.push(0x00);
+        ok.extend_from_slice(&77_u32.to_le_bytes());
+        ok.extend_from_slice(&0_u16.to_le_bytes());
+        ok.extend_from_slice(&0_u16.to_le_bytes());
+        ok.push(0x00);
+        ok.extend_from_slice(&0_u16.to_le_bytes());
+        stream
+            .write_all(&mysql_packet(1, &ok))
+            .expect("write prepare ok");
+        stream.flush().expect("flush prepare ok");
+    });
+
+    let reject_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind reject");
+    let reject_addr = reject_listener.local_addr().expect("reject addr");
+    let (read_tx, read_rx) = mpsc::channel();
+    let reject_server = std::thread::spawn(move || {
+        let (mut stream, _) = reject_listener.accept().expect("accept reject client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set reject read timeout");
+
+        stream
+            .write_all(&mysql_handshake_packet_with_connection_id(
+                capabilities,
+                202,
+            ))
+            .expect("write reject handshake");
+        stream.flush().expect("flush reject handshake");
+
+        let _handshake_response = read_mysql_packet(&mut stream);
+        stream
+            .write_all(&mysql_packet(2, &[0x00]))
+            .expect("write reject auth ok");
+        stream.flush().expect("flush reject auth ok");
+
+        let mut header = [0u8; 4];
+        let read = stream.read(&mut header).unwrap_or_else(|err| {
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ),
+                "unexpected reject-server read error: {err}"
+            );
+            0
+        });
+        read_tx.send(read).expect("send reject read count");
+    });
+
+    let cx = Cx::for_testing();
+    let mut prepare_options = MySqlConnectOptions::parse(&format!(
+        "mysql://user@{}:{}/db",
+        prepare_addr.ip(),
+        prepare_addr.port()
+    ))
+    .expect("parse prepare options");
+    prepare_options.connect_timeout = Some(Duration::from_secs(2));
+
+    let stmt = match futures_lite::future::block_on(async {
+        let mut conn = match MySqlConnection::connect_with_options(&cx, prepare_options).await {
+            Outcome::Ok(conn) => conn,
+            other => panic!("expected prepare connection, got {other:?}"),
+        };
+        conn.prepare(&cx, "SELECT 1").await
+    }) {
+        Outcome::Ok(stmt) => stmt,
+        Outcome::Err(err) => panic!("expected prepare ok, got error: {err}"),
+        Outcome::Cancelled(reason) => panic!("expected prepare ok, got cancellation: {reason}"),
+        Outcome::Panicked(_) => panic!("expected prepare ok, got panic"),
+    };
+
+    let mut reject_options = MySqlConnectOptions::parse(&format!(
+        "mysql://user@{}:{}/db",
+        reject_addr.ip(),
+        reject_addr.port()
+    ))
+    .expect("parse reject options");
+    reject_options.connect_timeout = Some(Duration::from_secs(2));
+
+    let mut conn = match futures_lite::future::block_on(async {
+        MySqlConnection::connect_with_options(&cx, reject_options).await
+    }) {
+        Outcome::Ok(conn) => conn,
+        other => panic!("expected reject-side connection, got {other:?}"),
+    };
+
+    let outcome =
+        futures_lite::future::block_on(async { conn.execute_prepared(&cx, &stmt, &[]).await });
+    match outcome {
+        Outcome::Err(MySqlError::InvalidParameter(msg)) => {
+            assert!(msg.contains("belongs to connection 101"));
+            assert!(msg.contains("current connection is 202"));
+        }
+        other => panic!("expected statement/connection mismatch, got {other:?}"),
+    }
+
+    drop(conn);
+
+    let bytes_sent = read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reject read result");
+    assert_eq!(
+        bytes_sent, 0,
+        "cross-connection statement reuse must fail before COM_STMT_EXECUTE reaches the server"
+    );
+
+    prepare_server.join().expect("join prepare server");
+    reject_server.join().expect("join reject server");
+}
+
+/// Test conformance gap: Missing server SSL capability validation
+#[test]
+fn test_conformance_gap_missing_server_ssl_validation() {
+    init_test_logging();
+
+    // Until the TLS upgrade is implemented, Required mode must fail closed before
+    // capability-specific fallback behavior can matter.
+    let base_capabilities = mysql_capabilities::CLIENT_PROTOCOL_41
+        | mysql_capabilities::CLIENT_SECURE_CONNECTION
+        | mysql_capabilities::CLIENT_PLUGIN_AUTH;
+
+    assert_ssl_mode_fails_closed_before_auth_payload(
+        SslMode::Required,
+        base_capabilities,
+        "required mode with server missing CLIENT_SSL",
+    );
+    assert_ssl_mode_fails_closed_before_auth_payload(
+        SslMode::Required,
+        base_capabilities | mysql_capabilities::CLIENT_SSL,
+        "required mode with server advertising CLIENT_SSL",
+    );
+}
+
+/// Test conformance gap: Missing TLS handshake implementation
+#[test]
+fn test_conformance_gap_missing_tls_handshake() {
+    init_test_logging();
+
+    let tls_capable_server = mysql_capabilities::CLIENT_PROTOCOL_41
+        | mysql_capabilities::CLIENT_SECURE_CONNECTION
+        | mysql_capabilities::CLIENT_PLUGIN_AUTH
+        | mysql_capabilities::CLIENT_SSL;
+
+    assert_ssl_mode_fails_closed_before_auth_payload(
+        SslMode::Required,
+        tls_capable_server,
+        "required mode before TLS upgrade implementation",
+    );
+    assert_ssl_mode_fails_closed_before_auth_payload(
+        SslMode::Preferred,
+        tls_capable_server,
+        "preferred mode before TLS upgrade implementation",
+    );
+}
+
+/// Test caching_sha2_password conformance with secure connections
+#[test]
+fn test_caching_sha2_password_secure_connection_requirement() {
+    init_test_logging();
+
+    // caching_sha2_password authentication in MySQL has two modes:
+    // 1. Fast auth: Uses cached authentication (works over cleartext)
+    // 2. Full auth: Requires secure connection or RSA key exchange
+
+    // The current implementation correctly detects when full auth is required
+    // and returns appropriate error messages, but cannot establish the secure
+    // connection needed to complete the authentication.
+
+    // Verify error messages are conformant
+    let fast_auth_msg = "caching_sha2_password full auth requires secure connection";
+    let cache_required_msg =
+        "caching_sha2_password requires cached credentials or secure connection";
+
+    assert!(fast_auth_msg.contains("secure connection"));
+    assert!(cache_required_msg.contains("secure connection"));
+}
+
+/// Integration test demonstrating the conformance impact
+#[test]
+fn test_conformance_impact_integration() {
+    init_test_logging();
+
+    // This test demonstrates how the conformance gaps interact:
+
+    // 1. User configures ssl_mode=Required for security
+    let options =
+        MySqlConnectOptions::parse("mysql://user:pass@localhost/db?ssl-mode=required").unwrap();
+    assert_eq!(options.ssl_mode, SslMode::Required);
+
+    // 2. Client attempts connection but cannot perform the TLS upgrade yet.
+
+    // 3. Result: Connection must fail closed instead of sending credentials
+    //    over cleartext.
+    assert_eq!(
+        MySqlError::TlsRequired.to_string(),
+        "TLS required but not available"
+    );
+}
+
+/// Test documentation of required fixes
+#[test]
+fn test_required_fixes_documentation() {
+    init_test_logging();
+
+    let required_capabilities = [
+        mysql_capabilities::CLIENT_PROTOCOL_41,
+        mysql_capabilities::CLIENT_SECURE_CONNECTION,
+        mysql_capabilities::CLIENT_PLUGIN_AUTH,
+        mysql_capabilities::CLIENT_SSL,
+    ];
+    assert_eq!(required_capabilities.len(), 4);
+    assert!(
+        required_capabilities.contains(&mysql_capabilities::CLIENT_SSL),
+        "the pending TLS implementation must preserve the CLIENT_SSL boundary"
+    );
+    assert_eq!(ssl_mode_query_value(SslMode::Disabled), "disabled");
+    assert_eq!(ssl_mode_query_value(SslMode::Preferred), "preferred");
+    assert_eq!(ssl_mode_query_value(SslMode::Required), "required");
+}

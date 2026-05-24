@@ -1,0 +1,210 @@
+# Fuzzing CI workflow for asupersync
+#
+# Runs fuzz targets on a schedule and on-demand to catch bugs early.
+# Uses cargo-fuzz with libFuzzer backend.
+
+name: Fuzz
+
+on:
+  # Run nightly
+  schedule:
+    - cron: '0 3 * * *'  # 3 AM UTC daily
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Fuzz target to run (or "all")'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - grpc_codec
+          - fuzz_http1_request
+          - fuzz_http1_response
+          - dns_resolver_name_compression
+          - h1_parsed_url
+          - length_delimited
+          - length_delimited_encode_width
+          - length_delimited_decoder_state
+          - fuzz_lines_codec
+          - length_delimited_frame_boundary
+          - bytes_slice_split_to
+          - bytes_cursor_reader
+          - bytes_take_adapter
+          - gf256_simd_edge_cases
+          - grpc_prost_codec_decode
+          - grpc_gzip_message_decode
+          - grpc_length_prefixed
+          - grpc_streaming
+          - fuzz_distributed_snapshot_merge
+          - h3_native_frames
+          - qpack_field_section
+          - kafka_protocol
+          - key_derivation_context
+          - region_heap_allocator
+          - otel_span_attributes
+          - quic_stream_flow
+          - symbol_auth
+          - symbol_cancel_broadcast
+          - postgres_bind_execute_sync
+          - postgres_scram
+          - mysql_ok_packet
+          - raptorq_decoder_gauss_matrix
+          - source_payload_hash_verification
+          - fuzz_raptorq_rfc6330
+          - tls_stream_record_framing
+          - transport_router
+          - fuzz_websocket_frame_parsing
+          - fuzz_hpack_decode
+          - hpack_indexed
+          - fuzz_http2_frame
+          - h2_connection_window_update
+          - h2_frame_decoder
+          - fuzz_interest_flags
+      duration:
+        description: 'Fuzz duration in seconds'
+        required: true
+        default: '300'
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  # Limit memory for fuzzing
+  ASAN_OPTIONS: malloc_context_size=64:quarantine_size_mb=256
+  # Use thin LTO for faster builds
+  CARGO_PROFILE_RELEASE_LTO: thin
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - grpc_codec
+          - fuzz_http1_request
+          - fuzz_http1_response
+          - dns_resolver_name_compression
+          - h1_parsed_url
+          - length_delimited
+          - length_delimited_encode_width
+          - length_delimited_decoder_state
+          - fuzz_lines_codec
+          - length_delimited_frame_boundary
+          - bytes_slice_split_to
+          - bytes_cursor_reader
+          - bytes_take_adapter
+          - gf256_simd_edge_cases
+          - grpc_prost_codec_decode
+          - grpc_gzip_message_decode
+          - grpc_length_prefixed
+          - grpc_streaming
+          - fuzz_distributed_snapshot_merge
+          - h3_native_frames
+          - qpack_field_section
+          - kafka_protocol
+          - key_derivation_context
+          - region_heap_allocator
+          - otel_span_attributes
+          - quic_stream_flow
+          - symbol_auth
+          - symbol_cancel_broadcast
+          - postgres_bind_execute_sync
+          - postgres_scram
+          - mysql_ok_packet
+          - raptorq_decoder_gauss_matrix
+          - source_payload_hash_verification
+          - fuzz_raptorq_rfc6330
+          - tls_stream_record_framing
+          - transport_router
+          - fuzz_websocket_frame_parsing
+          - fuzz_hpack_decode
+          - hpack_indexed
+          - fuzz_http2_frame
+          - h2_connection_window_update
+          - h2_frame_decoder
+          - fuzz_interest_flags
+        include:
+          # Critical targets get more time
+          - target: fuzz_hpack_decode
+            duration: 600
+          - target: fuzz_http2_frame
+            duration: 600
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-action@nightly
+        with:
+          components: llvm-tools-preview
+
+      - name: Require rch
+        run: |
+          RCH_BIN="${RCH_BIN:-$HOME/.local/bin/rch}"
+          if [[ ! -x "$RCH_BIN" ]]; then
+            echo "rch is required for fuzz jobs" >&2
+            exit 1
+          fi
+          echo "RCH_BIN=$RCH_BIN" >> "$GITHUB_ENV"
+
+      - name: Cache corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run fuzzer
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_DURATION: ${{ matrix.duration || inputs.duration || '300' }}
+        run: |
+          DURATION="${FUZZ_DURATION}"
+          TARGET_DIR="${TMPDIR:-/tmp}/rch_target_fuzz_${FUZZ_TARGET}"
+          echo "Fuzzing ${FUZZ_TARGET} for ${DURATION}s"
+          "$RCH_BIN" exec -- env \
+            CARGO_TARGET_DIR="${TARGET_DIR}" \
+            FUZZ_TARGET="${FUZZ_TARGET}" \
+            FUZZ_DURATION="${DURATION}" \
+            bash -lc "
+              set -euo pipefail
+              cargo install cargo-fuzz --locked
+              cd fuzz
+              cargo +nightly fuzz run \"\$FUZZ_TARGET\" -- \
+                -max_total_time=\"\$FUZZ_DURATION\" \
+                -print_final_stats=1 \
+                -jobs=4 \
+                -workers=4
+            "
+
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          retention-days: 30
+
+      - name: Upload corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          retention-days: 7
+
+  # Aggregate results
+  summary:
+    name: Fuzz Summary
+    needs: fuzz
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          echo "Fuzzing completed"
+          # This job runs even if some fuzz jobs fail
+          # Crashes are uploaded as artifacts for analysis
