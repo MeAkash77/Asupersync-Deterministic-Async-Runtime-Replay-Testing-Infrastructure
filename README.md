@@ -20,7 +20,7 @@
 <h3>Quick Install</h3>
 
 ```bash
-cargo add asupersync --git https://github.com/Dicklesworthstone/asupersync
+cargo add asupersync --https://github.com/MeAkash77/Asupersync-Deterministic-Async-Runtime-Replay-Testing-Infrastructure
 ```
 
 </div>
@@ -500,18 +500,18 @@ Interest-flag parity is also narrower than the shared `Interest` bitflag type su
 ### From Git (Recommended)
 
 ```bash
-# Add to Cargo.toml
-cargo add asupersync --git https://github.com/Dicklesworthstone/asupersync
+# Add to Cargo https://github.com/MeAkash77/Asupersync-Deterministic-Async-Runtime-Replay-Testing-Infrastructure.git
+cargo vadd asupersync --
 
 # Or manually add:
 # [dependencies]
-# asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
+# asupersync = { git = "https://github.com/MeAkash77/Asupersync-Deterministic-Async-Runtime-Replay-Testing-Infrastructure.git" }
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/Dicklesworthstone/asupersync.git
+git clone https://github.com/MeAkash77/Asupersync-Deterministic-Async-Runtime-Replay-Testing-Infrastructure.git
 cd asupersync
 rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_readme_docs cargo build --release
 ```
@@ -1728,7 +1728,7 @@ Asupersync is active development software with a fully implemented core runtime 
 
 ### How do I report bugs?
 
-Open an issue at https://github.com/Dicklesworthstone/asupersync/issues
+Open an issue at https://github.com/MeAkash77/Asupersync-Deterministic-Async-Runtime-Replay-Testing-Infrastructure.git
 
 ---
 
